@@ -273,55 +273,57 @@ export class User {
     if (limit && !isNaN(parseInt(limit))) {
       range = range.slice(parseInt(limit) * -1);
     }
-    let result = [];
-    for (let invoice of range) {
-      invoice = JSON.parse(invoice);
-      let decoded = lightningPayReq.decode(invoice.payment_request);
-      invoice.description = '';
-      for (let tag of decoded.tags) {
-        if (tag.tagName === 'description') {
-          try {
-            invoice.description += decodeURIComponent(tag.data);
-          } catch (_) {
-            invoice.description += tag.data;
+
+    const result = await Promise.all(
+      range.map(async (invoiceEntry) => {
+        const invoice = JSON.parse(invoiceEntry);
+        const decoded = lightningPayReq.decode(invoice.payment_request);
+        invoice.description = '';
+        for (let tag of decoded.tags) {
+          if (tag.tagName === 'description') {
+            try {
+              invoice.description += decodeURIComponent(tag.data);
+            } catch (_) {
+              invoice.description += tag.data;
+            }
+          }
+          if (tag.tagName === 'payment_hash') {
+            invoice.payment_hash = tag.data;
           }
         }
-        if (tag.tagName === 'payment_hash') {
-          invoice.payment_hash = tag.data;
+
+        let paymentHashPaidAmountSat = 0;
+        if (_invoice_ispaid_cache[invoice.payment_hash]) {
+          // static cache hit
+          invoice.ispaid = true;
+          paymentHashPaidAmountSat = _invoice_ispaid_cache[invoice.payment_hash];
+        } else {
+          // static cache miss, asking redis cache
+          paymentHashPaidAmountSat = await this.getPaymentHashPaid(invoice.payment_hash);
+          if (paymentHashPaidAmountSat) invoice.ispaid = true;
         }
-      }
 
-      let paymentHashPaidAmountSat = 0;
-      if (_invoice_ispaid_cache[invoice.payment_hash]) {
-        // static cache hit
-        invoice.ispaid = true;
-        paymentHashPaidAmountSat = _invoice_ispaid_cache[invoice.payment_hash];
-      } else {
-        // static cache miss, asking redis cache
-        paymentHashPaidAmountSat = await this.getPaymentHashPaid(invoice.payment_hash);
-        if (paymentHashPaidAmountSat) invoice.ispaid = true;
-      }
-
-      if (!invoice.ispaid) {
-        if (decoded && decoded.timestamp > +new Date() / 1000 - 3600 * 24 * 5) {
-          // if invoice is not too old we query lnd to find out if its paid
-          invoice.ispaid = await this.syncInvoicePaid(invoice.payment_hash);
-          paymentHashPaidAmountSat = await this.getPaymentHashPaid(invoice.payment_hash); // since we have just saved it
+        if (!invoice.ispaid) {
+          if (decoded && decoded.timestamp > +new Date() / 1000 - 3600 * 24 * 5) {
+            // if invoice is not too old we query lnd to find out if its paid
+            invoice.ispaid = await this.syncInvoicePaid(invoice.payment_hash);
+            paymentHashPaidAmountSat = await this.getPaymentHashPaid(invoice.payment_hash); // since we have just saved it
+          }
+        } else {
+          _invoice_ispaid_cache[invoice.payment_hash] = paymentHashPaidAmountSat;
         }
-      } else {
-        _invoice_ispaid_cache[invoice.payment_hash] = paymentHashPaidAmountSat;
-      }
 
-      invoice.amt =
-        paymentHashPaidAmountSat && parseInt(paymentHashPaidAmountSat) > decoded.satoshis
-          ? parseInt(paymentHashPaidAmountSat)
-          : decoded.satoshis;
-      invoice.expire_time = 3600 * 24;
-      // ^^^default; will keep for now. if we want to un-hardcode it - it should be among tags (`expire_time`)
-      invoice.timestamp = decoded.timestamp;
-      invoice.type = 'user_invoice';
-      result.push(invoice);
-    }
+        invoice.amt =
+          paymentHashPaidAmountSat && parseInt(paymentHashPaidAmountSat) > decoded.satoshis
+            ? parseInt(paymentHashPaidAmountSat)
+            : decoded.satoshis;
+        invoice.expire_time = 3600 * 24;
+        // ^^^default; will keep for now. if we want to un-hardcode it - it should be among tags (`expire_time`)
+        invoice.timestamp = decoded.timestamp;
+        invoice.type = 'user_invoice';
+        return invoice;
+      }),
+    );
 
     return result;
   }
