@@ -11,6 +11,33 @@ let _invoice_ispaid_cache = {};
 let _listtransactions_cache = false;
 let _listtransactions_cache_expiry_ts = 0;
 
+// Upper bound on simultaneous invoice lookups per request. Without a cap, a user
+// with many recent unpaid invoices would make every balance check fire one LND
+// lookup per invoice at the same time, which can overload the node.
+const DEFAULT_INVOICE_STATUS_CONCURRENCY = 8;
+const INVOICE_STATUS_CONCURRENCY = (() => {
+  const fromEnv = parseInt(process.env.INVOICE_STATUS_CONCURRENCY, 10);
+  return Number.isInteger(fromEnv) && fromEnv > 0 ? fromEnv : DEFAULT_INVOICE_STATUS_CONCURRENCY;
+})();
+
+/**
+ * Like `Promise.all(items.map(mapper))`, but runs at most `limit` mappers at once.
+ * Results keep the order of `items`; the first rejection rejects the whole call.
+ */
+async function mapWithConcurrency(items, limit, mapper) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  const worker = async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex++;
+      results[index] = await mapper(items[index], index);
+    }
+  };
+  const workerCount = Math.min(limit, items.length);
+  await Promise.all(Array.from({ length: workerCount }, worker));
+  return results;
+}
+
 export class User {
   /**
    *
@@ -274,56 +301,54 @@ export class User {
       range = range.slice(parseInt(limit) * -1);
     }
 
-    const result = await Promise.all(
-      range.map(async (invoiceEntry) => {
-        const invoice = JSON.parse(invoiceEntry);
-        const decoded = lightningPayReq.decode(invoice.payment_request);
-        invoice.description = '';
-        for (let tag of decoded.tags) {
-          if (tag.tagName === 'description') {
-            try {
-              invoice.description += decodeURIComponent(tag.data);
-            } catch (_) {
-              invoice.description += tag.data;
-            }
-          }
-          if (tag.tagName === 'payment_hash') {
-            invoice.payment_hash = tag.data;
+    const result = await mapWithConcurrency(range, INVOICE_STATUS_CONCURRENCY, async (invoiceEntry) => {
+      const invoice = JSON.parse(invoiceEntry);
+      const decoded = lightningPayReq.decode(invoice.payment_request);
+      invoice.description = '';
+      for (let tag of decoded.tags) {
+        if (tag.tagName === 'description') {
+          try {
+            invoice.description += decodeURIComponent(tag.data);
+          } catch (_) {
+            invoice.description += tag.data;
           }
         }
-
-        let paymentHashPaidAmountSat = 0;
-        if (_invoice_ispaid_cache[invoice.payment_hash]) {
-          // static cache hit
-          invoice.ispaid = true;
-          paymentHashPaidAmountSat = _invoice_ispaid_cache[invoice.payment_hash];
-        } else {
-          // static cache miss, asking redis cache
-          paymentHashPaidAmountSat = await this.getPaymentHashPaid(invoice.payment_hash);
-          if (paymentHashPaidAmountSat) invoice.ispaid = true;
+        if (tag.tagName === 'payment_hash') {
+          invoice.payment_hash = tag.data;
         }
+      }
 
-        if (!invoice.ispaid) {
-          if (decoded && decoded.timestamp > +new Date() / 1000 - 3600 * 24 * 5) {
-            // if invoice is not too old we query lnd to find out if its paid
-            invoice.ispaid = await this.syncInvoicePaid(invoice.payment_hash);
-            paymentHashPaidAmountSat = await this.getPaymentHashPaid(invoice.payment_hash); // since we have just saved it
-          }
-        } else {
-          _invoice_ispaid_cache[invoice.payment_hash] = paymentHashPaidAmountSat;
+      let paymentHashPaidAmountSat = 0;
+      if (_invoice_ispaid_cache[invoice.payment_hash]) {
+        // static cache hit
+        invoice.ispaid = true;
+        paymentHashPaidAmountSat = _invoice_ispaid_cache[invoice.payment_hash];
+      } else {
+        // static cache miss, asking redis cache
+        paymentHashPaidAmountSat = await this.getPaymentHashPaid(invoice.payment_hash);
+        if (paymentHashPaidAmountSat) invoice.ispaid = true;
+      }
+
+      if (!invoice.ispaid) {
+        if (decoded && decoded.timestamp > +new Date() / 1000 - 3600 * 24 * 5) {
+          // if invoice is not too old we query lnd to find out if its paid
+          invoice.ispaid = await this.syncInvoicePaid(invoice.payment_hash);
+          paymentHashPaidAmountSat = await this.getPaymentHashPaid(invoice.payment_hash); // since we have just saved it
         }
+      } else {
+        _invoice_ispaid_cache[invoice.payment_hash] = paymentHashPaidAmountSat;
+      }
 
-        invoice.amt =
-          paymentHashPaidAmountSat && parseInt(paymentHashPaidAmountSat) > decoded.satoshis
-            ? parseInt(paymentHashPaidAmountSat)
-            : decoded.satoshis;
-        invoice.expire_time = 3600 * 24;
-        // ^^^default; will keep for now. if we want to un-hardcode it - it should be among tags (`expire_time`)
-        invoice.timestamp = decoded.timestamp;
-        invoice.type = 'user_invoice';
-        return invoice;
-      }),
-    );
+      invoice.amt =
+        paymentHashPaidAmountSat && parseInt(paymentHashPaidAmountSat) > decoded.satoshis
+          ? parseInt(paymentHashPaidAmountSat)
+          : decoded.satoshis;
+      invoice.expire_time = 3600 * 24;
+      // ^^^default; will keep for now. if we want to un-hardcode it - it should be among tags (`expire_time`)
+      invoice.timestamp = decoded.timestamp;
+      invoice.type = 'user_invoice';
+      return invoice;
+    });
 
     return result;
   }
